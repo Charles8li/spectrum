@@ -121,7 +121,6 @@ message FileOffer {
   uint64 size = 3;
   bytes sha256 = 4;
   bool is_dir = 5;
-  string target_dir = 6;
 }
 
 message FileAccept {

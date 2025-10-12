@@ -1,9 +1,4 @@
-use std::{
-    io::{self as stdio, SeekFrom, Write},
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -22,11 +17,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rustls::{
     client::ServerCertVerifier, Certificate, ClientConnection, RootCertStore, ServerName,
 };
-use sha2::{Digest, Sha256};
-use tokio::{
-    fs::File,
-    io::{self, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Stdin},
-};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -41,8 +32,6 @@ enum Commands {
     Connect(ConnectArgs),
     Shell(ShellArgs),
     Send(SendArgs),
-    /// Launch the guided text interface
-    Interactive,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -58,17 +47,6 @@ struct SessionOptions {
 
     #[arg(long = "color", default_value = "yuv420")]
     color_format: String,
-}
-
-impl Default for SessionOptions {
-    fn default() -> Self {
-        Self {
-            video_codec: "tile".to_string(),
-            resolution: "1280x720".to_string(),
-            max_fps: 30,
-            color_format: "yuv420".to_string(),
-        }
-    }
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -113,8 +91,6 @@ struct SendArgs {
     target_dir: String,
     #[arg(long)]
     pin: Option<String>,
-    #[command(flatten)]
-    session: SessionOptions,
 }
 
 #[tokio::main]
@@ -124,225 +100,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Connect(args) => connect(args).await?,
         Commands::Shell(args) => shell(args).await?,
-        Commands::Send(args) => send(args).await?,
-        Commands::Interactive => interactive().await?,
+        Commands::Send(_) => {
+            warn!("send command not yet implemented in this MVP");
+        }
     }
     Ok(())
-}
-
-async fn interactive() -> Result<()> {
-    println!("LANRDP interactive console");
-    println!("Enter '-' for optional fields to clear stored values. Press Ctrl+D to exit.\n");
-
-    let mut reader = BufReader::new(tokio::io::stdin());
-    let mut session_defaults = SessionOptions::default();
-    let mut last_address = String::from("127.0.0.1:8443");
-    let mut last_pin: Option<String> = None;
-    let mut last_shell_cwd = String::from(".");
-    let mut last_shell_cols = 80u32;
-    let mut last_shell_rows = 24u32;
-    let mut last_source = String::from("./file.bin");
-    let mut last_target_dir = String::from("/tmp");
-
-    loop {
-        println!("==============================");
-        println!("[1] Connect test");
-        println!("[2] Interactive shell");
-        println!("[3] Send file");
-        println!("[q] Quit");
-
-        let choice = prompt_line(&mut reader, "Choice: ").await?;
-        match choice.as_str() {
-            "1" => {
-                let (address, pin, session) = prompt_connect_inputs(
-                    &mut reader,
-                    &last_address,
-                    last_pin.as_deref(),
-                    &session_defaults,
-                )
-                .await?;
-                if let Err(err) = connect(ConnectArgs {
-                    address: address.clone(),
-                    pin: pin.clone(),
-                    session: session.clone(),
-                })
-                .await
-                {
-                    eprintln!("Connection failed: {err:?}");
-                } else {
-                    println!("Connection succeeded.");
-                }
-                last_address = address;
-                last_pin = pin;
-                session_defaults = session;
-            }
-            "2" => {
-                let (address, pin, session) = prompt_connect_inputs(
-                    &mut reader,
-                    &last_address,
-                    last_pin.as_deref(),
-                    &session_defaults,
-                )
-                .await?;
-                let cwd =
-                    prompt_with_default(&mut reader, "Working directory", &last_shell_cwd).await?;
-                let cols = prompt_u32(&mut reader, "Columns", last_shell_cols).await?;
-                let rows = prompt_u32(&mut reader, "Rows", last_shell_rows).await?;
-
-                let mut args = ShellArgs {
-                    address: address.clone(),
-                    pin: pin.clone(),
-                    session: session.clone(),
-                    cwd: cwd.clone(),
-                    cols,
-                    rows,
-                };
-
-                if let Err(err) = shell(args.clone()).await {
-                    eprintln!("Shell session failed: {err:?}");
-                } else {
-                    println!("Shell session ended.");
-                }
-
-                last_address = address;
-                last_pin = pin;
-                session_defaults = session;
-                last_shell_cwd = cwd;
-                last_shell_cols = args.cols;
-                last_shell_rows = args.rows;
-            }
-            "3" => {
-                let (address, pin, session) = prompt_connect_inputs(
-                    &mut reader,
-                    &last_address,
-                    last_pin.as_deref(),
-                    &session_defaults,
-                )
-                .await?;
-                let source = prompt_with_default(&mut reader, "Source file", &last_source).await?;
-                let target_dir =
-                    prompt_with_default(&mut reader, "Target directory", &last_target_dir).await?;
-
-                if let Err(err) = send(SendArgs {
-                    address: address.clone(),
-                    source: source.clone(),
-                    target_dir: target_dir.clone(),
-                    pin: pin.clone(),
-                    session: session.clone(),
-                })
-                .await
-                {
-                    eprintln!("File transfer failed: {err:?}");
-                } else {
-                    println!("File transfer completed.");
-                }
-
-                last_address = address;
-                last_pin = pin;
-                session_defaults = session;
-                last_source = source;
-                last_target_dir = target_dir;
-            }
-            "q" | "Q" => {
-                println!("Goodbye");
-                break;
-            }
-            other => {
-                println!("Unrecognised choice '{other}'. Please select 1, 2, 3, or q.");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn prompt_connect_inputs(
-    reader: &mut BufReader<Stdin>,
-    last_address: &str,
-    last_pin: Option<&str>,
-    defaults: &SessionOptions,
-) -> Result<(String, Option<String>, SessionOptions)> {
-    let address = prompt_with_default(reader, "Server address", last_address).await?;
-    let pin = prompt_optional(reader, "PIN", last_pin).await?;
-    let session = prompt_session_options(reader, defaults).await?;
-    Ok((address, pin, session))
-}
-
-async fn prompt_session_options(
-    reader: &mut BufReader<Stdin>,
-    current: &SessionOptions,
-) -> Result<SessionOptions> {
-    let video_codec = prompt_with_default(reader, "Video codec", &current.video_codec).await?;
-    let resolution =
-        prompt_with_default(reader, "Resolution (e.g. 1280x720)", &current.resolution).await?;
-    let max_fps = prompt_u32(reader, "Maximum FPS", current.max_fps).await?;
-    let color_format = prompt_with_default(reader, "Color format", &current.color_format).await?;
-    Ok(SessionOptions {
-        video_codec,
-        resolution,
-        max_fps,
-        color_format,
-    })
-}
-
-async fn prompt_line(reader: &mut BufReader<Stdin>, prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    stdio::stdout().flush()?;
-    let mut buf = String::new();
-    let bytes = reader.read_line(&mut buf).await?;
-    if bytes == 0 {
-        return Err(anyhow!("standard input closed"));
-    }
-    Ok(buf.trim().to_string())
-}
-
-async fn prompt_with_default(
-    reader: &mut BufReader<Stdin>,
-    label: &str,
-    default: &str,
-) -> Result<String> {
-    let prompt = format!("{label} [{}]: ", default);
-    let input = prompt_line(reader, &prompt).await?;
-    if input.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input)
-    }
-}
-
-async fn prompt_optional(
-    reader: &mut BufReader<Stdin>,
-    label: &str,
-    current: Option<&str>,
-) -> Result<Option<String>> {
-    let prompt = match current {
-        Some(existing) => format!("{label} [{}] (Enter keeps, '-' clears): ", existing),
-        None => format!("{label} (press Enter to skip): "),
-    };
-    let input = prompt_line(reader, &prompt).await?;
-    if input.is_empty() {
-        Ok(current.map(|s| s.to_string()))
-    } else if input == "-" {
-        Ok(None)
-    } else {
-        Ok(Some(input))
-    }
-}
-
-async fn prompt_u32(reader: &mut BufReader<Stdin>, label: &str, default: u32) -> Result<u32> {
-    loop {
-        let prompt = format!("{label} [{}]: ", default);
-        let input = prompt_line(reader, &prompt).await?;
-        if input.is_empty() {
-            return Ok(default);
-        }
-        match input.parse::<u32>() {
-            Ok(value) => return Ok(value),
-            Err(_) => {
-                println!("Please enter a valid integer.");
-            }
-        }
-    }
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -424,127 +186,6 @@ async fn shell(args: ShellArgs) -> Result<()> {
     input_task.abort();
     let _ = input_task.await;
     let _ = output_task.await;
-
-    connection.close(0u32.into(), b"done");
-    endpoint.wait_idle().await?;
-
-    Ok(())
-}
-
-async fn send(args: SendArgs) -> Result<()> {
-    let (session, _) = establish_session(&args.address, args.pin.as_deref(), &args.session).await?;
-
-    let EstablishedSession {
-        endpoint,
-        connection,
-        mut control_send,
-        mut control_recv,
-    } = session;
-
-    let source_path = Path::new(&args.source);
-    let file_name = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("source must reference a file name"))?
-        .to_string();
-
-    let metadata = tokio::fs::metadata(source_path)
-        .await
-        .with_context(|| format!("missing source file: {}", source_path.display()))?;
-    if metadata.is_dir() {
-        anyhow::bail!("directory transfer is not supported in this MVP");
-    }
-
-    let mut file = File::open(source_path).await?;
-    let mut hasher = Sha256::new();
-    let mut hash_buf = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut hash_buf).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&hash_buf[..read]);
-    }
-    let digest = hasher.finalize();
-    let sha_bytes = Bytes::copy_from_slice(&digest[..]);
-
-    let file_size = metadata.len();
-    file.seek(SeekFrom::Start(0)).await?;
-
-    let mut rng = thread_rng();
-    let file_id: u64 = rng.gen();
-
-    let offer = ControlEnvelope {
-        msg: Some(Msg::FileOffer(proto::FileOffer {
-            id: file_id,
-            name: file_name.clone(),
-            size: file_size,
-            sha256: sha_bytes.clone(),
-            is_dir: false,
-            target_dir: args.target_dir.clone(),
-        })),
-    };
-    send_message(&mut control_send, &offer).await?;
-    info!(id = file_id, size = file_size, "sent file offer");
-
-    let accept = loop {
-        let env: ControlEnvelope = recv_message(&mut control_recv).await?;
-        match env.msg {
-            Some(Msg::FileAccept(accept)) if accept.id == file_id => break accept,
-            Some(Msg::FileComplete(done)) if done.id == file_id => {
-                warn!("received premature completion for file {file_id}");
-            }
-            Some(_) | None => continue,
-        }
-    };
-
-    if accept.resume_offset > file_size {
-        anyhow::bail!("remote requested resume past end of file");
-    }
-
-    let (mut file_send, mut file_recv) = connection.open_bi().await?;
-    lanrdp_common::StreamDescriptor::file(file_id as u32)
-        .write_header(&mut file_send)
-        .await?;
-    let descriptor = lanrdp_common::StreamDescriptor::read_header(&mut file_recv).await?;
-    if descriptor.ty != lanrdp_common::STREAM_TYPE_FILE || descriptor.extra != Some(file_id as u32)
-    {
-        anyhow::bail!("agent rejected file stream");
-    }
-
-    drop(file_recv);
-
-    if accept.resume_offset > 0 {
-        file.seek(SeekFrom::Start(accept.resume_offset)).await?;
-    }
-
-    let mut sent = accept.resume_offset;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buf).await?;
-        if read == 0 {
-            lanrdp_common::send_bytes(&mut file_send, Bytes::new()).await?;
-            break;
-        }
-        lanrdp_common::send_bytes(&mut file_send, Bytes::copy_from_slice(&buf[..read])).await?;
-        sent += read as u64;
-    }
-    file_send.finish().await?;
-    info!(id = file_id, sent, "completed upload stream");
-
-    let complete = loop {
-        let env: ControlEnvelope = recv_message(&mut control_recv).await?;
-        match env.msg {
-            Some(Msg::FileComplete(done)) if done.id == file_id => break done,
-            Some(_) | None => continue,
-        }
-    };
-
-    if complete.sha256 != sha_bytes {
-        warn!("remote reported mismatched checksum for file {file_id}");
-    } else {
-        info!(id = file_id, "remote verified checksum");
-    }
 
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await?;

@@ -1,10 +1,4 @@
-use std::{
-    io::SeekFrom,
-    net::SocketAddr,
-    path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::Arc,
-};
+use std::{net::SocketAddr, path::Path, process::Stdio, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -19,10 +13,8 @@ use quinn::Endpoint;
 use rand::{rngs::OsRng, RngCore};
 use rcgen::{Certificate, CertificateParams};
 use rustls::{Certificate as RustlsCertificate, PrivateKey};
-use sha2::{Digest, Sha256};
 use tokio::{
-    fs::{self, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
@@ -275,15 +267,6 @@ async fn handle_connection(
                         "shell resize requested (not yet implemented)"
                     );
                 }
-                Some(Msg::FileOffer(offer)) => {
-                    let control_send = control_send.clone();
-                    let connection = connection.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_file_offer(connection, control_send, offer).await {
-                            warn!(?err, "file transfer failed");
-                        }
-                    });
-                }
                 Some(_) => {
                     warn!("unhandled control message");
                 }
@@ -306,75 +289,6 @@ fn random_bytes() -> Bytes {
     let mut buf = vec![0u8; 32];
     OsRng.fill_bytes(&mut buf);
     buf.into()
-}
-
-async fn handle_file_offer(
-    connection: quinn::Connection,
-    control_send: Arc<Mutex<quinn::SendStream>>,
-    offer: proto::FileOffer,
-) -> Result<()> {
-    if offer.is_dir {
-        anyhow::bail!("directory transfer is not supported in this build");
-    }
-    if offer.id > u32::MAX as u64 {
-        anyhow::bail!("file identifier exceeds supported range");
-    }
-
-    let dest_path = resolve_target_path(&offer.target_dir, &offer.name)?;
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let resume_offset = match fs::metadata(&dest_path).await {
-        Ok(meta) => meta.len().min(offer.size),
-        Err(_) => 0,
-    };
-
-    info!(
-        id = offer.id,
-        path = %dest_path.display(),
-        resume_offset,
-        "accepting file offer"
-    );
-
-    {
-        let mut guard = control_send.lock().await;
-        let accept = ControlEnvelope {
-            msg: Some(Msg::FileAccept(proto::FileAccept {
-                id: offer.id,
-                target_dir: offer.target_dir.clone(),
-                overwrite: resume_offset == 0,
-                resume_offset,
-            })),
-        };
-        send_message(&mut *guard, &accept).await?;
-    }
-
-    receive_file_stream(connection, control_send, offer, dest_path, resume_offset).await
-}
-
-fn resolve_target_path(base: &str, name: &str) -> Result<PathBuf> {
-    let name_path = Path::new(name);
-    if name_path.is_absolute() {
-        anyhow::bail!("file name must be relative");
-    }
-    for component in name_path.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!("file name may not traverse directories");
-        }
-    }
-
-    let mut dest = if base.is_empty() {
-        PathBuf::from(".")
-    } else {
-        PathBuf::from(base)
-    };
-    dest.push(name_path);
-    Ok(dest)
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 struct ShellResources {
@@ -525,101 +439,6 @@ async fn run_shell_session(
         },
     )
     .await?;
-
-    Ok(())
-}
-
-async fn receive_file_stream(
-    connection: quinn::Connection,
-    control_send: Arc<Mutex<quinn::SendStream>>,
-    offer: proto::FileOffer,
-    dest_path: PathBuf,
-    resume_offset: u64,
-) -> Result<()> {
-    let file_id = offer.id as u32;
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    let descriptor = lanrdp_common::StreamDescriptor::read_header(&mut recv).await?;
-    if descriptor.ty != lanrdp_common::STREAM_TYPE_FILE || descriptor.extra != Some(file_id) {
-        anyhow::bail!("unexpected stream type for file transfer {}", offer.id);
-    }
-
-    lanrdp_common::StreamDescriptor::file(file_id)
-        .write_header(&mut send)
-        .await?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(&dest_path)
-        .await?;
-    if resume_offset == 0 {
-        file.set_len(0).await?;
-    }
-    file.seek(SeekFrom::Start(resume_offset)).await?;
-
-    let mut received = resume_offset;
-    loop {
-        match lanrdp_common::recv_bytes(&mut recv).await {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    break;
-                }
-                file.write_all(&bytes).await?;
-                received += bytes.len() as u64;
-            }
-            Err(err) => {
-                warn!(id = offer.id, ?err, "file stream ended unexpectedly");
-                break;
-            }
-        }
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-
-    let mut hasher = Sha256::new();
-    let mut reader = fs::File::open(&dest_path).await?;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buf).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    let digest = hasher.finalize();
-    let digest_bytes = Bytes::copy_from_slice(&digest[..]);
-
-    {
-        let mut guard = control_send.lock().await;
-        let complete = ControlEnvelope {
-            msg: Some(Msg::FileComplete(proto::FileComplete {
-                id: offer.id,
-                sha256: digest_bytes.clone(),
-            })),
-        };
-        send_message(&mut *guard, &complete).await?;
-    }
-
-    let expected = offer.sha256.as_ref();
-    if expected != digest_bytes.as_ref() {
-        warn!(
-            id = offer.id,
-            expected = %to_hex(expected),
-            actual = %to_hex(digest_bytes.as_ref()),
-            "file checksum mismatch"
-        );
-    } else {
-        info!(
-            id = offer.id,
-            path = %dest_path.display(),
-            size = received,
-            "stored file"
-        );
-    }
-
-    let _ = send.finish().await;
 
     Ok(())
 }
