@@ -1,0 +1,23 @@
+[package]
+name = "lanrdp-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+hmac = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "fs"] }
+prost = "0.12"
+prost-types = "0.12"
+dirs = "5"
+
+[build-dependencies]
+prost-build = "0.12"
+
+[features]
+default = []
