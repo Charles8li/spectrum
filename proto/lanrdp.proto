@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package lanrdp;
+
+message Hello {
+  string device_id = 1;
+  string name = 2;
+  string version = 3;
+  repeated string caps = 4;
+}
+
+enum AuthMethod {
+  AUTH_METHOD_PIN = 0;
+  AUTH_METHOD_RESUME = 1;
+}
+
+message Auth {
+  AuthMethod method = 1;
+  bytes challenge = 2;
+  bytes proof = 3;
+}
+
+message AuthOk {
+  bytes session_token = 1;
+}
+
+enum ColorFormat {
+  COLOR_FORMAT_RGB565 = 0;
+  COLOR_FORMAT_YUV420 = 1;
+}
+
+enum VideoCodec {
+  VIDEO_CODEC_H264 = 0;
+  VIDEO_CODEC_TILE = 1;
+}
+
+message SessionConfig {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 max_fps = 3;
+  ColorFormat color = 4;
+  VideoCodec video = 5;
+}
+
+message ShellOpen {
+  string cwd = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+message ShellOpened {
+  uint32 sid = 1;
+}
+
+message ShellData {
+  uint32 sid = 1;
+  bytes data = 2;
+}
+
+message ShellExit {
+  uint32 sid = 1;
+  int32 code = 2;
+}
+
+message ShellResize {
+  uint32 sid = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+message KeyEvent {
+  uint32 scancode = 1;
+  bool down = 2;
+}
+
+enum MouseEventType {
+  MOUSE_EVENT_TYPE_MOVE = 0;
+  MOUSE_EVENT_TYPE_BUTTON = 1;
+  MOUSE_EVENT_TYPE_SCROLL = 2;
+}
+
+message MouseEvent {
+  MouseEventType type = 1;
+  int32 x = 2;
+  int32 y = 3;
+  int32 delta_x = 4;
+  int32 delta_y = 5;
+  uint32 button = 6;
+  bool down = 7;
+}
+
+message InputEvent {
+  oneof event {
+    KeyEvent key = 1;
+    MouseEvent mouse = 2;
+  }
+}
+
+message Tile {
+  uint32 x = 1;
+  uint32 y = 2;
+  bytes data = 3;
+}
+
+message VideoFrameHeader {
+  uint64 seq = 1;
+  uint64 ts_ms = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  bool key = 5;
+  VideoCodec codec = 6;
+  ColorFormat color = 7;
+  uint32 stride = 8;
+  bytes payload = 9;
+  repeated Tile tiles = 10;
+}
+
+message FileOffer {
+  uint64 id = 1;
+  string name = 2;
+  uint64 size = 3;
+  bytes sha256 = 4;
+  bool is_dir = 5;
+  string target_dir = 6;
+}
+
+message FileAccept {
+  uint64 id = 1;
+  string target_dir = 2;
+  bool overwrite = 3;
+  uint64 resume_offset = 4;
+}
+
+message FileChunk {
+  uint64 id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message FileComplete {
+  uint64 id = 1;
+  bytes sha256 = 2;
+}
+
+message ControlEnvelope {
+  oneof msg {
+    SessionConfig session_config = 1;
+    ShellOpen shell_open = 2;
+    ShellOpened shell_opened = 3;
+    ShellData shell_data = 4;
+    ShellExit shell_exit = 5;
+    ShellResize shell_resize = 6;
+    InputEvent input_event = 7;
+    FileOffer file_offer = 8;
+    FileAccept file_accept = 9;
+    FileChunk file_chunk = 10;
+    FileComplete file_complete = 11;
+    Auth auth = 12;
+    AuthOk auth_ok = 13;
+    Hello hello = 14;
+  }
+}
