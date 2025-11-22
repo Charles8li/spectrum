@@ -17,7 +17,13 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rustls::{
     client::ServerCertVerifier, Certificate, ClientConnection, RootCertStore, ServerName,
 };
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use tokio::{
+    fs,
+    fs::File,
+    io::{self, AsyncReadExt, AsyncWriteExt, BufReader},
+};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -47,6 +53,17 @@ struct SessionOptions {
 
     #[arg(long = "color", default_value = "yuv420")]
     color_format: String,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            video_codec: "tile".to_string(),
+            resolution: "1280x720".to_string(),
+            max_fps: 30,
+            color_format: "rgb565".to_string(),
+        }
+    }
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -100,9 +117,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Connect(args) => connect(args).await?,
         Commands::Shell(args) => shell(args).await?,
-        Commands::Send(_) => {
-            warn!("send command not yet implemented in this MVP");
-        }
+        Commands::Send(args) => send_file(args).await?,
     }
     Ok(())
 }
@@ -117,17 +132,27 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         fps = prefs.max_fps,
         color = ?prefs.color,
         video = ?prefs.video,
-        "session configured",
+        "session configured, starting video and input streams",
     );
 
-    let EstablishedSession {
-        endpoint,
-        connection,
-        ..
-    } = session;
+    let video_task = tokio::spawn(consume_video_stream(session.connection.clone()));
+    let input_task = tokio::spawn(pump_input_stream(session.connection.clone()));
 
-    connection.close(0u32.into(), b"done");
-    endpoint.wait_idle().await?;
+    tokio::select! {
+        result = video_task => {
+            if let Err(err) = result? {
+                warn!(?err, "video stream ended with error");
+            }
+        }
+        result = input_task => {
+            if let Err(err) = result? {
+                warn!(?err, "input stream ended with error");
+            }
+        }
+    }
+
+    session.connection.close(0u32.into(), b"done");
+    session.endpoint.wait_idle().await?;
 
     Ok(())
 }
@@ -461,4 +486,207 @@ fn parse_video(video: &str) -> Result<VideoCodec> {
         "tile" => Ok(VideoCodec::VideoCodecTile),
         other => Err(anyhow!("unsupported video codec: {other}")),
     }
+}
+
+async fn consume_video_stream(connection: quinn::Connection) -> Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    lanrdp_common::StreamDescriptor::video()
+        .write_header(&mut send)
+        .await?;
+    let descriptor = lanrdp_common::StreamDescriptor::read_header(&mut recv).await?;
+    if descriptor.ty != lanrdp_common::STREAM_TYPE_VIDEO {
+        anyhow::bail!("server rejected video stream");
+    }
+
+    loop {
+        match recv_message::<_, proto::VideoFrameHeader>(&mut recv).await {
+            Ok(frame) => {
+                let payload_len = frame.payload.len()
+                    + frame
+                        .tiles
+                        .iter()
+                        .map(|tile| tile.data.len())
+                        .sum::<usize>();
+                info!(
+                    seq = frame.seq,
+                    width = frame.width,
+                    height = frame.height,
+                    key = frame.key,
+                    codec = ?frame.codec,
+                    color = ?frame.color,
+                    bytes = payload_len,
+                    "received video frame"
+                );
+            }
+            Err(err) => {
+                warn!(?err, "video stream closed");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn pump_input_stream(connection: quinn::Connection) -> Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    lanrdp_common::StreamDescriptor::input()
+        .write_header(&mut send)
+        .await?;
+    let descriptor = lanrdp_common::StreamDescriptor::read_header(&mut recv).await?;
+    if descriptor.ty != lanrdp_common::STREAM_TYPE_INPUT {
+        anyhow::bail!("server rejected input stream");
+    }
+
+    let mut reader = BufReader::new(io::stdin());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 {
+            let _ = send.finish().await;
+            break;
+        }
+
+        for ch in line.chars() {
+            let down = proto::InputEvent {
+                event: Some(proto::input_event::Event::Key(proto::KeyEvent {
+                    scancode: ch as u32,
+                    down: true,
+                })),
+            };
+            send_message(&mut send, &down).await?;
+
+            let up = proto::InputEvent {
+                event: Some(proto::input_event::Event::Key(proto::KeyEvent {
+                    scancode: ch as u32,
+                    down: false,
+                })),
+            };
+            send_message(&mut send, &up).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_file(args: SendArgs) -> Result<()> {
+    let defaults = SessionOptions::default();
+    let (session, _) = establish_session(&args.address, args.pin.as_deref(), &defaults).await?;
+    transfer_file(session, &args.source, &args.target_dir).await
+}
+
+async fn transfer_file(session: EstablishedSession, source: &str, target_dir: &str) -> Result<()> {
+    let path = Path::new(source);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("source must be a file path"))?
+        .to_string();
+    let metadata = fs::metadata(path).await?;
+    if metadata.is_dir() {
+        anyhow::bail!("directory uploads are not supported yet");
+    }
+    let size = metadata.len();
+    let sha = hash_file(path).await?;
+
+    let id: u64 = rand::thread_rng().gen();
+    let mut control_send = session.control_send;
+    let mut control_recv = session.control_recv;
+
+    let offer = ControlEnvelope {
+        msg: Some(Msg::FileOffer(proto::FileOffer {
+            id,
+            name: name.clone(),
+            size,
+            sha256: sha.clone().into(),
+            is_dir: metadata.is_dir(),
+        })),
+    };
+    send_message(&mut control_send, &offer).await?;
+
+    let accept = ControlEnvelope {
+        msg: Some(Msg::FileAccept(proto::FileAccept {
+            id,
+            target_dir: target_dir.to_string(),
+            overwrite: true,
+            resume_offset: 0,
+        })),
+    };
+    send_message(&mut control_send, &accept).await?;
+
+    // Wait for agent acknowledgement that the transfer is ready
+    loop {
+        let env: ControlEnvelope = recv_message(&mut control_recv).await?;
+        match env.msg {
+            Some(Msg::FileAccept(ack)) if ack.id == id => {
+                break;
+            }
+            Some(Msg::FileComplete(complete)) if complete.id == id => {
+                info!("transfer already complete", id);
+                return Ok(());
+            }
+            Some(_) | None => continue,
+        }
+    }
+
+    let (mut file_send, mut file_recv) = session.connection.open_bi().await?;
+    lanrdp_common::StreamDescriptor::file(id as u32)
+        .write_header(&mut file_send)
+        .await?;
+    let descriptor = lanrdp_common::StreamDescriptor::read_header(&mut file_recv).await?;
+    if descriptor.ty != lanrdp_common::STREAM_TYPE_FILE || descriptor.extra != Some(id as u32) {
+        anyhow::bail!("server rejected file stream");
+    }
+
+    let mut file = File::open(path).await?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut offset = 0u64;
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        let chunk = proto::FileChunk {
+            id,
+            offset,
+            data: Bytes::copy_from_slice(&buf[..read]),
+        };
+        send_message(&mut file_send, &chunk).await?;
+        offset += read as u64;
+    }
+    file_send.finish().await?;
+
+    loop {
+        let env: ControlEnvelope = recv_message(&mut control_recv).await?;
+        if let Some(Msg::FileComplete(done)) = env.msg {
+            if done.id == id {
+                if done.sha256 == sha {
+                    info!(bytes = size, name, "file transfer completed");
+                } else {
+                    warn!("remote reported mismatched checksum");
+                }
+                break;
+            }
+        }
+    }
+
+    session.connection.close(0u32.into(), b"done");
+    session.endpoint.wait_idle().await?;
+
+    Ok(())
+}
+
+async fn hash_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().to_vec())
 }

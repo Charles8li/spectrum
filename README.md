@@ -19,8 +19,6 @@ This workspace contains a minimal prototype of a LAN remote desktop stack built 
 
 ## Known gaps / next steps
 
-* Video streaming, input injection, and file transfer are only scaffolded at the protobuf level; no runtime handling exists yet.
-* The client `send` subcommand is stubbed and does not initiate transfers.
 * Shell resize messages are accepted but currently logged without resizing the PTY.
 
 ## What was implemented for this iteration?
@@ -29,6 +27,7 @@ This workspace contains a minimal prototype of a LAN remote desktop stack built 
 * A PTY-like shell bridge: the agent spawns `/bin/sh -i` (or `cmd /K` on Windows), forwards local stdout/stderr over a dedicated QUIC stream, and writes remote stdin back into the process. This demonstrates the "simultaneously receive and send" requirement in a concrete, measurable way.
 * Client-side helpers to request a shell (`lanrdp shell host:port`), stream local keyboard input to the remote shell, print remote output live, and surface the remote exit code once the session ends.
 * Shared session configuration parsing so that both `connect` and `shell` support the same `--video/--res/--fps/--color` knobs, plus optional terminal geometry via `--cols/--rows`.
+* Runtime handling for video streaming, input injection, and file transfer initiated from the `send` subcommand.
 
 ## Building
 
@@ -53,4 +52,4 @@ The initial connection requires the pairing PIN to derive a pre-shared key (PSK)
 3. Client immediately opens the matching PTY stream and begins pushing stdin chunks while reading stdout/stderr frames in parallel. Both halves use simple length-prefixed frames (`send_bytes`/`recv_bytes`).
 4. When the child process terminates, the agent sends `ShellExit{sid, code}` on the control stream; the client surfaces that exit code after draining pending output.
 
-> **Note**: Video streaming, input injection and file transfer remain scaffolded by protobuf definitions and stream headers, but they now sit alongside a functioning bidirectional data path that proves the transport and authentication layers.
+> **Note**: Video streaming, input injection and file transfer now have runtime handlers: the agent captures the current screen each frame, injects key and mouse input on receipt, and persists uploaded files to the requested target directory.
