@@ -1,9 +1,27 @@
 # spectrum / LANRDP MVP
 
-This workspace contains a minimal prototype of a LAN remote desktop stack built in Rust. The prototype exposes two binaries that can now drive a complete authenticated control flow and an interactive shell stream:
+This workspace contains a minimal prototype of a LAN remote desktop stack built in Rust. It ships two binaries that exercise the authentication and transport layers end to end:
 
-* `lanrdp-agent` – runs on the controlled device, listens for QUIC/TLS connections, and can spawn local shell sessions that stream stdout/stderr back to the caller while consuming stdin over QUIC.
+* `lanrdp-agent` – runs on the controlled device, listens for QUIC/TLS connections, and spawns local shell sessions that stream stdout/stderr back to the caller while consuming stdin over QUIC.
 * `lanrdp-client` – negotiates the control channel, persists the shared secret for resumable sessions, and provides both a `connect` sanity check and a fully interactive `shell` command.
+
+## Project layout
+
+* `crates/common` – shared protocol bindings (generated from `proto/lanrdp.proto`), stream framing helpers, HMAC/PSK derivation, and JSON-backed session persistence for both agent and client.
+* `crates/agent` – QUIC server that authenticates with either a one-time PIN or a stored PSK, acknowledges session preferences, and hosts one or more PTY-style shell sessions over dedicated QUIC streams.
+* `crates/client` – QUIC client with `connect` and `shell` subcommands. It handles pairing/resumption, writes session preferences, opens PTY streams, and forwards stdin/stdout to the remote shell.
+
+## Current capabilities
+
+* Authenticated control channel: PIN-based pairing derives a PSK keyed by the device ID; subsequent connections can resume with the stored PSK and session token without re-entering the PIN.
+* Session negotiation: client and agent exchange resolution, frame rate, color, and video codec preferences before opening feature streams.
+* Interactive shell: the client requests a shell (`lanrdp client shell ...`), the agent spawns `/bin/sh -i` (or `cmd /K` on Windows), and stdin/stdout/stderr are bridged over a dedicated QUIC stream until the remote process exits.
+
+## Known gaps / next steps
+
+* Video streaming, input injection, and file transfer are only scaffolded at the protobuf level; no runtime handling exists yet.
+* The client `send` subcommand is stubbed and does not initiate transfers.
+* Shell resize messages are accepted but currently logged without resizing the PTY.
 
 ## What was implemented for this iteration?
 
