@@ -40,6 +40,7 @@ migration of application computation to another device.
 
 Planned capabilities:
 
+- Support Windows, Linux, and macOS.
 - Control supported applications through typed, structured commands.
 - View and control one application window you authorize.
 - Request screenshots and opt-in recordings of that authorized window.
