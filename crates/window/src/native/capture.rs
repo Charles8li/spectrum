@@ -40,6 +40,7 @@ type CaptureRequest = SyncSender<Result<Frame>>;
 
 pub struct WindowCapture {
     choice: WindowChoice,
+    frame_size: (i32, i32),
     closed: Arc<AtomicBool>,
     info: WindowInfo,
     requests: SyncSender<CaptureRequest>,
@@ -48,6 +49,7 @@ pub struct WindowCapture {
 impl WindowCapture {
     pub fn open(choice: WindowChoice, target: TargetRef) -> Result<Self> {
         ensure!(choice.is_current(), "selected window is unavailable");
+        let frame_size = choice.frame_size()?;
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = closed.clone();
         let (requests, receive) = mpsc::sync_channel::<CaptureRequest>(1);
@@ -84,12 +86,18 @@ impl WindowCapture {
         let info = status
             .recv_timeout(Duration::from_secs(5))
             .context("window capture initialization timed out")??;
-        Ok(Self {
+        let capture = Self {
             choice,
+            frame_size,
             closed,
             info,
             requests,
-        })
+        };
+        ensure!(
+            capture.is_current(),
+            "selected window changed during initialization"
+        );
+        Ok(capture)
     }
 }
 
@@ -98,7 +106,15 @@ impl FrameSource for WindowCapture {
         self.info
     }
     fn is_current(&self) -> bool {
-        !self.closed.load(Ordering::Acquire) && self.choice.is_current()
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let current =
+            self.choice.is_current() && self.choice.frame_size().ok() == Some(self.frame_size);
+        if !current {
+            self.closed.store(true, Ordering::Release);
+        }
+        current
     }
     fn capture(&mut self) -> Result<Frame> {
         ensure!(self.is_current(), "shared window is unavailable");
@@ -353,5 +369,274 @@ impl Drop for NativeCapture {
         let _ = self.item.RemoveClosed(self.closed_token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{identity::SERVER_NAME, native::WindowView};
+    use lanrdp_common::{
+        authorization::{Capability, Grant, PeerId},
+        transport::{quic_client_config, quic_server_config},
+        window::{recv_json, send_json, serve_window, WindowHello},
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::{num::NonZeroU64, sync::Mutex};
+    use windows::Win32::{
+        Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED},
+        UI::WindowsAndMessaging::{
+            IsIconic, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
+        },
+    };
+
+    fn target() -> TargetRef {
+        TargetRef {
+            id: NonZeroU64::new(1).unwrap(),
+            generation: NonZeroU64::new(1).unwrap(),
+        }
+    }
+
+    fn identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut parameters = rcgen::CertificateParams::new(vec![SERVER_NAME.into()]).unwrap();
+        parameters.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        (
+            parameters.self_signed(&key).unwrap().der().clone(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and uses only an owned synthetic window"]
+    fn moving_an_owned_window_keeps_its_capture_current() -> Result<()> {
+        let window = WindowView::open("Spectrum - Synthetic move test")?;
+        let choice = window.choice()?;
+        let capture = WindowCapture::open(choice, target())?;
+        unsafe {
+            SetWindowPos(
+                choice.hwnd(),
+                None,
+                64,
+                64,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        ensure!(capture.is_current(), "moving the window ended its capture");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and uses only an owned synthetic window"]
+    fn resizing_an_owned_window_invalidates_capture_before_the_next_frame() -> Result<()> {
+        let window = WindowView::open("Spectrum - Synthetic resize test")?;
+        let choice = window.choice()?;
+        let mut capture = WindowCapture::open(choice, target())?;
+        unsafe {
+            SetWindowPos(
+                choice.hwnd(),
+                None,
+                0,
+                0,
+                640,
+                400,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        ensure!(!capture.is_current(), "resized window remained authorized");
+        ensure!(
+            capture.capture().is_err(),
+            "resized window returned a frame"
+        );
+        unsafe {
+            SetWindowPos(
+                choice.hwnd(),
+                None,
+                0,
+                0,
+                800,
+                520,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        ensure!(
+            !capture.is_current(),
+            "resized window became authorized again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and uses only an owned synthetic window"]
+    fn minimizing_an_owned_window_invalidates_capture() -> Result<()> {
+        let window = WindowView::open("Spectrum - Synthetic minimize test")?;
+        let choice = window.choice()?;
+        let mut capture = WindowCapture::open(choice, target())?;
+        unsafe {
+            let _ = ShowWindow(choice.hwnd(), SW_MINIMIZE);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !unsafe { IsIconic(choice.hwnd()).as_bool() } && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ensure!(
+            unsafe { IsIconic(choice.hwnd()).as_bool() },
+            "window did not minimize"
+        );
+        ensure!(
+            !capture.is_current(),
+            "minimized window remained authorized"
+        );
+        ensure!(
+            capture.capture().is_err(),
+            "minimized window returned a frame"
+        );
+        unsafe {
+            let _ = ShowWindow(choice.hwnd(), SW_RESTORE);
+        }
+        ensure!(
+            !capture.is_current(),
+            "restored window became authorized again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and uses only an owned synthetic window"]
+    fn cloaking_an_owned_window_invalidates_capture() -> Result<()> {
+        let window = WindowView::open("Spectrum - Synthetic visibility test")?;
+        let choice = window.choice()?;
+        let mut capture = WindowCapture::open(choice, target())?;
+        let enabled = 1i32;
+        unsafe {
+            DwmSetWindowAttribute(
+                choice.hwnd(),
+                DWMWA_CLOAK,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            )?;
+        }
+        let mut state = 0u32;
+        unsafe {
+            DwmGetWindowAttribute(
+                choice.hwnd(),
+                DWMWA_CLOAKED,
+                (&mut state as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )?;
+        }
+        ensure!(state != 0, "synthetic window did not become cloaked");
+        ensure!(!capture.is_current(), "cloaked window remained authorized");
+        ensure!(
+            capture.capture().is_err(),
+            "cloaked window returned a frame"
+        );
+        let disabled = 0i32;
+        unsafe {
+            DwmSetWindowAttribute(
+                choice.hwnd(),
+                DWMWA_CLOAK,
+                (&disabled as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            )?;
+        }
+        ensure!(
+            !capture.is_current(),
+            "uncloaked window became authorized again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an interactive Windows desktop and uses only an owned synthetic window"]
+    async fn resizing_an_owned_window_ends_an_idle_encrypted_session() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let window = WindowView::open("Spectrum - Synthetic session resize")?;
+            let choice = window.choice()?;
+            let capture = WindowCapture::open(choice, target())?;
+            let (client_certificate, client_key) = identity();
+            let (server_certificate, server_key) = identity();
+            let server = quinn::Endpoint::server(
+                quic_server_config(
+                    client_certificate.clone(),
+                    server_certificate.clone(),
+                    server_key,
+                )?,
+                "127.0.0.1:0".parse()?,
+            )?;
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+            client.set_default_client_config(quic_client_config(
+                server_certificate,
+                client_certificate.clone(),
+                client_key,
+            )?);
+            let connect = async {
+                Ok::<_, anyhow::Error>(client.connect(server.local_addr()?, SERVER_NAME)?.await?)
+            };
+            let accept = async {
+                Ok::<_, anyhow::Error>(
+                    server
+                        .accept()
+                        .await
+                        .context("missing synthetic peer")?
+                        .await?,
+                )
+            };
+            let (client_connection, server_connection) = tokio::try_join!(connect, accept)?;
+            let grant = Grant::new(
+                PeerId::from_certificate(&client_certificate)?,
+                target(),
+                &[Capability::ReadFrame],
+                Instant::now(),
+                Duration::from_secs(6),
+            )?;
+            let source = Arc::new(Mutex::new(capture));
+            let handler = tokio::spawn(async move {
+                serve_window(&server_connection, source, grant, || true).await
+            });
+            let (mut send, mut recv) = client_connection.open_bi().await?;
+            send_json(
+                &mut send,
+                &WindowHello {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await?;
+            let info: WindowInfo = recv_json(&mut recv).await?;
+            info.validate()?;
+            unsafe {
+                SetWindowPos(
+                    choice.hwnd(),
+                    None,
+                    0,
+                    0,
+                    640,
+                    400,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
+            }
+            tokio::time::timeout(Duration::from_secs(2), client_connection.closed())
+                .await
+                .context("resized window did not stop the idle session")?;
+            ensure!(
+                handler.await?.is_err(),
+                "resized window remained authorized"
+            );
+            client.close(0u32.into(), b"test ended");
+            server.close(0u32.into(), b"test ended");
+            window.sink().close();
+            window.wait();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("synthetic session test timed out")?
     }
 }

@@ -9,7 +9,10 @@ use windows::{
     core::{w, PCWSTR},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::*,
+        Graphics::{
+            Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
+            Gdi::*,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::*,
     },
@@ -28,6 +31,40 @@ impl WindowChoice {
     pub(crate) fn hwnd(self) -> HWND {
         HWND(self.handle as *mut _)
     }
+    pub(crate) fn frame_size(self) -> Result<(i32, i32)> {
+        let mut bounds = RECT::default();
+        unsafe {
+            DwmGetWindowAttribute(
+                self.hwnd(),
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut bounds as *mut RECT).cast(),
+                std::mem::size_of::<RECT>() as u32,
+            )?;
+        }
+        let width = bounds
+            .right
+            .checked_sub(bounds.left)
+            .context("invalid window bounds")?;
+        let height = bounds
+            .bottom
+            .checked_sub(bounds.top)
+            .context("invalid window bounds")?;
+        ensure!(width > 0 && height > 0, "invalid window bounds");
+        Ok((width, height))
+    }
+    fn is_uncloaked(self) -> bool {
+        let mut state = 0u32;
+        unsafe {
+            DwmGetWindowAttribute(
+                self.hwnd(),
+                DWMWA_CLOAKED,
+                (&mut state as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && state == 0
+        }
+    }
     pub fn is_current(self) -> bool {
         unsafe {
             let window = self.hwnd();
@@ -37,6 +74,7 @@ impl WindowChoice {
             IsWindow(Some(window)).as_bool()
                 && IsWindowVisible(window).as_bool()
                 && !IsIconic(window).as_bool()
+                && self.is_uncloaked()
                 && process == self.process
                 && thread == self.thread
                 && (popup == window || !IsWindowVisible(popup).as_bool())

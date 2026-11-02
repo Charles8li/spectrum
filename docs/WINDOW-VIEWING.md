@@ -34,6 +34,10 @@ exceptions to the relevant executable, authorized peer, and required UDP ports
 5. The viewer opens when the sharing device is ready. Close the viewer or the
    sharing window to end the session.
 
+Interactive sharing lasts at most five minutes. To share again after it expires,
+start the connection process again on both devices. Stop and revocation checks
+run periodically, so an operation already in progress may not stop immediately.
+
 The code expires after two minutes and permits one connection attempt. If pairing
 fails, close the programs and start again to obtain a new code. The code is used
 only for that pairing attempt; it is not the long-term identity key. Do not send
@@ -50,7 +54,8 @@ mutually authenticated, hybrid-only TLS 1.3 connection for window viewing.
 
 The selected image can contain visible title-bar text. The local chooser's list
 of other window titles is not sent. Closing, minimizing, resizing, or invalidating
-the selected window stops sharing; it never falls back to the desktop. Unknown
+the selected window stops sharing. Sharing also stops if Windows marks the window
+as cloaked (hidden by the system). It never falls back to the desktop. Unknown
 active owned popups stop the selected-window path.
 
 ## Local check and unpairing

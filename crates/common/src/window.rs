@@ -64,7 +64,7 @@ pub struct WindowHello {
     pub version: u16,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowInfo {
     pub version: u16,
@@ -184,6 +184,18 @@ pub trait FrameSource: Send + 'static {
     fn capture(&mut self) -> Result<Frame>;
 }
 
+fn current_target<S: FrameSource>(
+    source: &Mutex<S>,
+    expected: WindowInfo,
+) -> Result<Option<TargetRef>> {
+    let capture = source
+        .lock()
+        .map_err(|_| anyhow::anyhow!("capture state is unavailable"))?;
+    let current_info = capture.info();
+    ensure!(current_info == expected, "shared window metadata changed");
+    Ok(capture.is_current().then_some(current_info.target))
+}
+
 pub async fn serve_window<S: FrameSource>(
     connection: &quinn::Connection,
     source: Arc<Mutex<S>>,
@@ -210,19 +222,17 @@ pub async fn serve_window<S: FrameSource>(
             hello.version == PROTOCOL_VERSION,
             "unsupported window protocol version"
         );
+        ensure!(trust_current(), "pairing was revoked");
+        grant.validate_scope(peer, current_target(&source, info)?, Instant::now())?;
         send_json(&mut send, &info).await?;
         for _ in 0..3600 {
             let request: CommandRequest = recv_json(&mut recv).await?;
             tokio::time::sleep(FRAME_INTERVAL).await;
             ensure!(trust_current(), "pairing was revoked");
-            let current = source
-                .lock()
-                .map_err(|_| anyhow::anyhow!("capture state is unavailable"))?
-                .is_current();
             let command = grant.authorize(
                 peer,
                 &request,
-                current.then_some(info.target),
+                current_target(&source, info)?,
                 Instant::now(),
             )?;
             match command {
@@ -237,14 +247,7 @@ pub async fn serve_window<S: FrameSource>(
                     })
                     .await??;
                     ensure!(trust_current(), "pairing was revoked");
-                    let current = source
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("capture state is unavailable"))?
-                        .is_current();
-                    ensure!(
-                        current && Instant::now() < grant.expires_at(),
-                        "window authorization ended"
-                    );
+                    grant.validate_scope(peer, current_target(&source, info)?, Instant::now())?;
                     ensure!(
                         frame.width == info.width && frame.height == info.height,
                         "shared window changed size"

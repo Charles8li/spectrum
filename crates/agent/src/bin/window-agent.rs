@@ -189,6 +189,42 @@ async fn interactive(_: IdentityStore) -> Result<()> {
 }
 
 #[cfg(windows)]
+async fn until_sharing_stops<S, F>(
+    source: &Mutex<S>,
+    trusted: impl Fn() -> bool,
+    stopped: impl Fn() -> bool,
+    deadline: tokio::time::Instant,
+    activity: F,
+) -> Result<()>
+where
+    S: FrameSource,
+    F: std::future::Future<Output = Result<()>>,
+{
+    let monitor = async {
+        loop {
+            if stopped() {
+                return Ok(());
+            }
+            ensure!(trusted(), "pairing was revoked");
+            match source.try_lock() {
+                Ok(source) => ensure!(source.is_current(), "shared window is unavailable"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("capture state is unavailable")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        result = monitor => result,
+        _ = tokio::time::sleep_until(deadline) => Err(anyhow::anyhow!("window authorization expired")),
+        result = activity => result,
+    }
+}
+
+#[cfg(windows)]
 async fn share(store: IdentityStore, listen: SocketAddr, seconds: u64, demo: bool) -> Result<()> {
     use rand::Rng;
     use spectrum_window::native::{choose_window, WindowCapture, WindowView};
@@ -237,32 +273,50 @@ async fn share(store: IdentityStore, listen: SocketAddr, seconds: u64, demo: boo
         quinn::Endpoint::server(config, listen).context(FailureStage::SharingListener)?;
     println!("Ready to share the selected window with the paired peer. Close the sharing window to stop.");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-    let result=async {
+    let activity = async {
         for _ in 0..3 {
-            if stop_signal.closed() { return Ok(()); }
+            if stop_signal.closed() {
+                return Ok(());
+            }
             ensure!(store.peer_is(&peer), "pairing was revoked");
-            let incoming=tokio::select! {
-                incoming=endpoint.accept()=>incoming.context("window listener closed")?,
-                _=tokio::time::sleep_until(deadline)=>anyhow::bail!("window authorization expired"),
-                _=async { while store.peer_is(&peer) && !stop_signal.closed() { tokio::time::sleep(Duration::from_millis(100)).await; } }=> {
-                    if stop_signal.closed() { return Ok(()); }
-                    anyhow::bail!("pairing was revoked")
-                },
-            };
-            match tokio::time::timeout(IO_TIMEOUT,incoming).await {
+            let incoming = endpoint.accept().await.context("window listener closed")?;
+            match tokio::time::timeout(IO_TIMEOUT, incoming).await {
                 Ok(Ok(connection)) => {
-                    let now=Instant::now();
-                    let remaining=deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let grant=Grant::new(PeerId::from_certificate(&peer)?, target, &[Capability::DescribeTarget, Capability::ReadFrame], now, remaining)?;
-                    let session = serve_window(&connection,source.clone(),grant,||store.peer_is(&peer)&&!stop_signal.closed()).await;
-                    if stop_signal.closed() { return Ok(()); }
+                    if stop_signal.closed() {
+                        return Ok(());
+                    }
+                    ensure!(store.peer_is(&peer), "pairing was revoked");
+                    let now = Instant::now();
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let grant = Grant::new(
+                        PeerId::from_certificate(&peer)?,
+                        target,
+                        &[Capability::DescribeTarget, Capability::ReadFrame],
+                        now,
+                        remaining,
+                    )?;
+                    let session = serve_window(&connection, source.clone(), grant, || {
+                        store.peer_is(&peer) && !stop_signal.closed()
+                    })
+                    .await;
+                    if stop_signal.closed() {
+                        return Ok(());
+                    }
                     return session;
                 }
                 _ => eprintln!("Connection rejected."),
             }
         }
         anyhow::bail!("connection attempt limit reached")
-    }.await;
+    };
+    let result = until_sharing_stops(
+        &source,
+        || store.peer_is(&peer),
+        || stop_signal.closed(),
+        deadline,
+        activity,
+    )
+    .await;
     endpoint.close(0u32.into(), b"window sharing ended");
     drop(stop);
     drop(fixture);
@@ -277,6 +331,139 @@ async fn share(_: IdentityStore, _: SocketAddr, _: u64, _: bool) -> Result<()> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use lanrdp_common::{
+        authorization::PROTOCOL_VERSION,
+        window::{Frame, WindowInfo},
+    };
+    use std::{
+        num::NonZeroU64,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    struct WaitingSource(Arc<AtomicBool>);
+
+    impl FrameSource for WaitingSource {
+        fn info(&self) -> WindowInfo {
+            WindowInfo {
+                version: PROTOCOL_VERSION,
+                target: TargetRef {
+                    id: NonZeroU64::new(1).unwrap(),
+                    generation: NonZeroU64::new(1).unwrap(),
+                },
+                width: 1,
+                height: 1,
+            }
+        }
+
+        fn is_current(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+
+        fn capture(&mut self) -> Result<Frame> {
+            anyhow::bail!("unexpected synthetic capture")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WaitingInterruption {
+        Cancel,
+        Revoke,
+        CloseTarget,
+        Expire,
+    }
+
+    async fn interrupted_wait(interruption: WaitingInterruption) -> Result<()> {
+        let current = Arc::new(AtomicBool::new(true));
+        let trusted = Arc::new(AtomicBool::new(true));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let source = Mutex::new(WaitingSource(current.clone()));
+        let deadline = tokio::time::Instant::now()
+            + if matches!(interruption, WaitingInterruption::Expire) {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_secs(3)
+            };
+        let transition = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            match interruption {
+                WaitingInterruption::Cancel => stopped.store(true, Ordering::Release),
+                WaitingInterruption::Revoke => trusted.store(false, Ordering::Release),
+                WaitingInterruption::CloseTarget => current.store(false, Ordering::Release),
+                WaitingInterruption::Expire => {}
+            }
+        };
+        let pending = until_sharing_stops(
+            &source,
+            || trusted.load(Ordering::Acquire),
+            || stopped.load(Ordering::Acquire),
+            deadline,
+            std::future::pending(),
+        );
+        let (result, _) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(pending, transition)
+        })
+        .await?;
+        match interruption {
+            WaitingInterruption::Cancel => ensure!(result.is_ok()),
+            _ => ensure!(result.is_err()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_connection_stops_after_user_cancels() -> Result<()> {
+        interrupted_wait(WaitingInterruption::Cancel).await
+    }
+
+    #[tokio::test]
+    async fn pending_connection_stops_after_pairing_is_revoked() -> Result<()> {
+        interrupted_wait(WaitingInterruption::Revoke).await
+    }
+
+    #[tokio::test]
+    async fn pending_connection_stops_after_the_target_closes() -> Result<()> {
+        interrupted_wait(WaitingInterruption::CloseTarget).await
+    }
+
+    #[tokio::test]
+    async fn pending_connection_stops_at_authorization_deadline() -> Result<()> {
+        interrupted_wait(WaitingInterruption::Expire).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_does_not_wait_for_a_busy_capture() -> Result<()> {
+        let source = Arc::new(Mutex::new(WaitingSource(Arc::new(AtomicBool::new(true)))));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held_source = source.clone();
+        let worker = std::thread::spawn(move || {
+            let _guard = held_source.lock().unwrap();
+            let _ = locked.send(());
+            let _ = released.recv_timeout(Duration::from_secs(2));
+        });
+        ready.await?;
+        let transition = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stopped.store(true, Ordering::Release);
+        };
+        let pending = until_sharing_stops(
+            &source,
+            || true,
+            || stopped.load(Ordering::Acquire),
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            std::future::pending(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pending, transition)
+        })
+        .await;
+        release.send(())?;
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("synthetic capture worker failed"))?;
+        result?.0
+    }
 
     #[test]
     fn capture_size_failures_are_distinguished_from_other_capture_errors() {
