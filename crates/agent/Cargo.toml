@@ -1,0 +1,32 @@
+[package]
+name = "lanrdp-agent"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+default-run = "spectrum-window-agent"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+enigo.workspace = true
+lanrdp-common = { path = "../common" }
+quinn.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+screenshots.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+spectrum-window = { path = "../window" }
+zeroize.workspace = true
+
+[[bin]]
+name = "spectrum-window-agent"
+path = "src/bin/window-agent.rs"
+
+[[bin]]
+name = "spectrum-window-check"
+path = "src/bin/window-check.rs"
